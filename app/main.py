@@ -26,7 +26,8 @@ from urllib.parse import parse_qsl
 from contextlib import contextmanager
 
 from fastapi import FastAPI, Request, Response, HTTPException, Path, Query, Body, Depends
-from fastapi.responses import JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, RedirectResponse, PlainTextResponse, HTMLResponse
+from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 
@@ -63,9 +64,38 @@ app = FastAPI(
                 "simulator, auth playground, and a SQLite-backed CRUD resource. "
                 "Use the **Try it out** buttons below to fire real requests.",
     root_path=ROOT_PATH,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url=None,   # served by custom routes below (with a back-to-portfolio link)
+    redoc_url=None,
 )
+
+
+# ---------- docs pages with a "back to portfolio" link ----------
+BACK_LINK = (
+    '<a href="/" title="Back to portfolio" style="position:fixed;top:12px;right:16px;'
+    'z-index:9999;font-family:\'IBM Plex Mono\',ui-monospace,monospace;font-size:13px;'
+    'font-weight:600;color:#c1440e;text-decoration:none;background:#ece8df;'
+    'border:1px solid #cfc9bb;padding:7px 13px;border-radius:4px;'
+    'box-shadow:0 1px 4px rgba(0,0,0,.10);">&larr; vladyslav.taran</a>'
+)
+
+
+def _with_back(html: HTMLResponse) -> HTMLResponse:
+    body = html.body.decode().replace("</body>", BACK_LINK + "</body>")
+    return HTMLResponse(body)
+
+
+@app.get("/docs", include_in_schema=False)
+def swagger_docs(request: Request):
+    p = request.scope.get("root_path", "") or ROOT_PATH
+    return _with_back(get_swagger_ui_html(
+        openapi_url=p + "/openapi.json", title=app.title + " — Swagger UI"))
+
+
+@app.get("/redoc", include_in_schema=False)
+def redoc_docs(request: Request):
+    p = request.scope.get("root_path", "") or ROOT_PATH
+    return _with_back(get_redoc_html(
+        openapi_url=p + "/openapi.json", title=app.title + " — ReDoc"))
 
 
 # ---------- database ----------
