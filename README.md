@@ -29,6 +29,8 @@ real requests from the browser.
 | DELETE | `/api/items/{id}` | **delete** one |
 | DELETE | `/api/items` | reset all |
 
+> Writes (`POST/PUT/PATCH/DELETE`) require an `X-API-Key` header — see [Security](#security--abuse-limits). Reads are open.
+
 ### Request inspector
 | Method | Path | Description |
 |---|---|---|
@@ -94,12 +96,42 @@ browser ──HTTPS──► nginx (chrome.net.ua, existing cert, limit_req)
 - **Backend:** `app/main.py` — FastAPI, one file. Persistence via stdlib `sqlite3`.
 - Runs as a hardened **systemd** service (`www-data`, `ProtectSystem=strict`).
 
-## Security
-- Bound to **127.0.0.1** only; nginx is the sole public entry.
-- nginx **rate limiting** (`limit_req`) + **1 MB body cap**.
-- Bounded inputs: delay ≤ 10 s, bytes ≤ 100 KB, redirects ≤ 20, validated types.
-- No SSRF surface — the API never fetches user-supplied URLs.
-- `API_SECRET` (token signing) lives only in `/etc/testapi.env` (root-owned, 600).
+## Security & abuse limits
+
+Defense in depth, so a public sandbox can't be exhausted or vandalised — e.g.
+someone trying to insert 10 million rows or wipe the data:
+
+- **Writes require a key.** `POST/PUT/PATCH/DELETE /items` need an `X-API-Key`
+  header (`API_WRITE_KEY`); reads stay open. No anonymous mutation. In Swagger,
+  click **Authorize** to paste the key.
+- **Hard row cap** — `POST /items` returns **409** once the table reaches
+  `API_MAX_ITEMS` (default **1000**), so unbounded growth is impossible.
+- **Storage guard** — inserts return **507** if `data.db` exceeds
+  `API_MAX_DB_BYTES` (default **50 MB**); the disk can't be filled.
+- **Field caps** — `name` ≤ 200 chars, ≤ 20 tags, each tag ≤ 50 chars, `qty`
+  bounded → invalid input is **422**.
+- **Rate limiting (nginx)** — 10 req/s per IP overall, **1 req/s for writes**
+  (`POST/PUT/PATCH/DELETE`), and a **10-connection** cap per IP.
+- **1 MB body cap**; bounded sim endpoints (delay ≤ 10 s, bytes ≤ 100 KB,
+  redirects ≤ 20).
+- **Nightly auto-reset** — `/etc/cron.d/testapi-reset` runs `reset.py`: backs up
+  `data.db` (keeps 7), wipes `items`, reseeds demo rows — so any pollution is
+  temporary.
+- **Isolation** — bound to `127.0.0.1` (nginx is the only public entry); runs as
+  a hardened **systemd** service (`www-data`, `ProtectSystem=strict`, writes only
+  `/opt/testapi`). No SSRF surface — it never fetches user-supplied URLs.
+- **Secrets** — `API_SECRET` (token signing) and `API_WRITE_KEY` live only in
+  `/etc/testapi.env` (root-owned, `600`) — never in the repo.
+
+### Configuration (env — `/etc/testapi.env`)
+| Var | Default | Purpose |
+|---|---|---|
+| `API_ROOT_PATH` | `""` | external path prefix (`/api` in prod) |
+| `API_DB` | `./data.db` | SQLite file path |
+| `API_SECRET` | dev value | HMAC key for `/token` |
+| `API_WRITE_KEY` | `""` (open) | required `X-API-Key` for mutations |
+| `API_MAX_ITEMS` | `1000` | hard row ceiling |
+| `API_MAX_DB_BYTES` | `52428800` | storage guard (50 MB) |
 
 ## Run locally
 

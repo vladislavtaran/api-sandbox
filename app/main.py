@@ -25,9 +25,10 @@ from typing import Optional, List
 from urllib.parse import parse_qsl
 from contextlib import contextmanager
 
-from fastapi import FastAPI, Request, Response, HTTPException, Path, Query, Body
+from fastapi import FastAPI, Request, Response, HTTPException, Path, Query, Body, Depends
 from fastapi.responses import JSONResponse, RedirectResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, Field, field_validator
 
 # ---------- config ----------
 ROOT_PATH = os.environ.get("API_ROOT_PATH", "")          # "/api" in production
@@ -36,6 +37,11 @@ SECRET = os.environ.get("API_SECRET", "dev-secret-change-me").encode()
 VERSION = "1.0.0"
 SCHEMA_VERSION = 1
 STARTED = time.time()
+
+# abuse limits
+MAX_ITEMS = int(os.environ.get("API_MAX_ITEMS", "1000"))            # hard row ceiling
+MAX_DB_BYTES = int(os.environ.get("API_MAX_DB_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+WRITE_KEY = os.environ.get("API_WRITE_KEY", "")                     # gate mutations (prod)
 
 
 def _commit():
@@ -86,9 +92,27 @@ def init_db():
                  updated  TEXT NOT NULL)"""
         )
         con.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
+        # seed a little demo data so reads always show something
+        if con.execute("SELECT COUNT(*) c FROM items").fetchone()["c"] == 0:
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            con.executemany(
+                "INSERT INTO items(name, qty, tags, created, updated) VALUES(?,?,?,?,?)",
+                [("sample-widget", 5, '["demo"]', ts, ts),
+                 ("sample-gadget", 2, "[]", ts, ts)])
 
 
 init_db()
+
+
+# ---------- write gate (mutations require X-API-Key when API_WRITE_KEY is set) ----------
+_write_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_write(key: Optional[str] = Depends(_write_scheme)):
+    if not WRITE_KEY:
+        return  # dev / unset: writes are open
+    if not key or not hmac.compare_digest(key, WRITE_KEY):
+        raise HTTPException(401, "writes require a valid X-API-Key")
 
 
 def now():
@@ -180,16 +204,29 @@ def version():
 # ============================================================
 # CRUD — items
 # ============================================================
+def _check_tags(v):
+    if v is None:
+        return v
+    for t in v:
+        if len(t) > 50:
+            raise ValueError("each tag must be <= 50 characters")
+    return v
+
+
 class ItemIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=200, examples=["widget"])
-    qty: int = Field(0, ge=0, examples=[5])
-    tags: List[str] = Field(default_factory=list, examples=[["demo", "test"]])
+    qty: int = Field(0, ge=0, le=1_000_000_000, examples=[5])
+    tags: List[str] = Field(default_factory=list, max_length=20, examples=[["demo", "test"]])
+
+    _v_tags = field_validator("tags")(_check_tags)
 
 
 class ItemPatch(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=200)
-    qty: Optional[int] = Field(None, ge=0)
-    tags: Optional[List[str]] = None
+    qty: Optional[int] = Field(None, ge=0, le=1_000_000_000)
+    tags: Optional[List[str]] = Field(None, max_length=20)
+
+    _v_tags = field_validator("tags")(_check_tags)
 
 
 @app.get("/items", tags=["items"], summary="List / search items")
@@ -213,8 +250,16 @@ def list_items(
             "items": [row_to_item(r) for r in rows]}
 
 
-@app.post("/items", tags=["items"], status_code=201, summary="Add a new item")
+@app.post("/items", tags=["items"], status_code=201, summary="Add a new item",
+          dependencies=[Depends(require_write)])
 def create_item(item: ItemIn):
+    with db() as con:
+        count = con.execute("SELECT COUNT(*) c FROM items").fetchone()["c"]
+    if count >= MAX_ITEMS:
+        raise HTTPException(409, "item limit reached (%d) — this is a sandbox and "
+                                 "auto-resets daily" % MAX_ITEMS)
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > MAX_DB_BYTES:
+        raise HTTPException(507, "storage limit reached")
     ts = now()
     with db() as con:
         cur = con.execute(
@@ -234,7 +279,8 @@ def get_item(item_id: int = Path(..., ge=1)):
     return row_to_item(row)
 
 
-@app.put("/items/{item_id}", tags=["items"], summary="Replace an item")
+@app.put("/items/{item_id}", tags=["items"], summary="Replace an item",
+         dependencies=[Depends(require_write)])
 def replace_item(item_id: int, item: ItemIn):
     with db() as con:
         exists = con.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
@@ -246,7 +292,8 @@ def replace_item(item_id: int, item: ItemIn):
     return row_to_item(row)
 
 
-@app.patch("/items/{item_id}", tags=["items"], summary="Partially update an item")
+@app.patch("/items/{item_id}", tags=["items"], summary="Partially update an item",
+           dependencies=[Depends(require_write)])
 def patch_item(item_id: int, patch: ItemPatch):
     with db() as con:
         row = con.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
@@ -261,7 +308,8 @@ def patch_item(item_id: int, patch: ItemPatch):
     return row_to_item(row)
 
 
-@app.delete("/items/{item_id}", tags=["items"], summary="Delete one item")
+@app.delete("/items/{item_id}", tags=["items"], summary="Delete one item",
+            dependencies=[Depends(require_write)])
 def delete_item(item_id: int):
     with db() as con:
         cur = con.execute("DELETE FROM items WHERE id=?", (item_id,))
@@ -270,7 +318,8 @@ def delete_item(item_id: int):
     return {"deleted": item_id}
 
 
-@app.delete("/items", tags=["items"], summary="Delete ALL items (reset)")
+@app.delete("/items", tags=["items"], summary="Delete ALL items (reset)",
+            dependencies=[Depends(require_write)])
 def reset_items():
     with db() as con:
         n = con.execute("SELECT COUNT(*) c FROM items").fetchone()["c"]

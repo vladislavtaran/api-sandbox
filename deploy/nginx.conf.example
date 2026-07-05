@@ -1,9 +1,23 @@
 # --- add to the http {} block (once) ---
-limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+limit_req_zone $binary_remote_addr zone=apilim:10m rate=10r/s;
+
+# stricter, write-only limit: key is empty (unlimited) for GET/HEAD, the client
+# IP for mutating methods, so only writes are throttled to 1 r/s.
+map $request_method $api_write_key {
+    default "";
+    POST    $binary_remote_addr;
+    PUT     $binary_remote_addr;
+    PATCH   $binary_remote_addr;
+    DELETE  $binary_remote_addr;
+}
+limit_req_zone $api_write_key zone=apiwrite:10m rate=1r/s;
+limit_conn_zone $binary_remote_addr zone=apiconn:10m;
 
 # --- add inside the server {} block for chrome.net.ua (443) ---
 location /api/ {
-    limit_req zone=api burst=20 nodelay;
+    limit_req  zone=apilim   burst=20 nodelay;   # 10 r/s overall
+    limit_req  zone=apiwrite burst=3  nodelay;   # 1 r/s writes only
+    limit_conn apiconn 10;                        # max 10 concurrent conns/IP
     client_max_body_size 1m;
 
     proxy_pass http://127.0.0.1:8092/;   # trailing slash strips the /api/ prefix
