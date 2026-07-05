@@ -1,0 +1,26 @@
+[Unit]
+Description=chrome.net.ua API Sandbox (FastAPI/Uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/testapi
+EnvironmentFile=/etc/testapi.env
+ExecStart=/opt/testapi/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8092
+Restart=on-failure
+RestartSec=2
+
+# hardening — least privilege
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/testapi
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
