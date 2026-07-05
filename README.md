@@ -99,6 +99,27 @@ someone trying to insert 10 million rows or wipe the data:
 | `API_MAX_ITEMS` | `1000` | hard row ceiling |
 | `API_MAX_DB_BYTES` | `52428800` | storage guard (50 MB) |
 
+## Logs & audit
+
+Every request is recorded — **who** (client IP + user-agent), **when**
+(UTC timestamp), and **what** (method, path, status, duration) — including failed
+and unauthorized (`401`) attempts:
+
+```
+2026-07-05T19:10:09Z 24.5.138.137 GET /items 200 3ms "curl/8.7.1"
+2026-07-05T19:10:09Z 24.5.138.137 POST /items 401 1ms "curl/8.7.1"
+```
+
+- **Via the API** (needs the key): `GET /api/logs?limit=100` with `X-API-Key`.
+  Hidden from the docs list.
+- **On the server:** `tail -f /opt/testapi/access.log` — a **rotating** file
+  (5 MB × 3, so it can't grow unbounded). The shared nginx edge log also has it:
+  `grep ' /api/' /var/log/nginx/access.log`.
+
+```bash
+curl -s "https://chrome.net.ua/api/logs?limit=50" -H "X-API-Key: <key>"
+```
+
 ## Run locally
 
 ```bash

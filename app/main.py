@@ -14,10 +14,12 @@ Stdlib + FastAPI/Uvicorn only. Persistence is stdlib SQLite in a single file
 import os
 import time
 import hmac
+import logging
 import sqlite3
 import json as jsonlib
 from typing import Optional, List
 from contextlib import contextmanager
+from logging.handlers import RotatingFileHandler
 
 from fastapi import FastAPI, Request, HTTPException, Path, Query, Depends
 from fastapi.responses import HTMLResponse
@@ -36,6 +38,23 @@ STARTED = time.time()
 MAX_ITEMS = int(os.environ.get("API_MAX_ITEMS", "1000"))            # hard row ceiling
 MAX_DB_BYTES = int(os.environ.get("API_MAX_DB_BYTES", str(50 * 1024 * 1024)))  # 50 MB
 WRITE_KEY = os.environ.get("API_WRITE_KEY", "")                     # gate mutations (prod)
+
+# ---------- audit log: who / when / what, rotating so it can't grow unbounded ----------
+LOG_PATH = os.environ.get("API_LOG", os.path.join(os.path.dirname(DB_PATH) or ".", "access.log"))
+access_log = logging.getLogger("api.access")
+access_log.setLevel(logging.INFO)
+if not access_log.handlers:
+    _h = RotatingFileHandler(LOG_PATH, maxBytes=5_000_000, backupCount=3)
+    _h.setFormatter(logging.Formatter("%(message)s"))
+    access_log.addHandler(_h)
+    access_log.propagate = False
+
+
+def client_ip(request):
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.headers.get("x-real-ip") or (request.client.host if request.client else "-")
 
 
 def _commit():
@@ -61,6 +80,22 @@ app = FastAPI(
     docs_url=None,   # served by custom routes below (with a back-to-portfolio link)
     redoc_url=None,
 )
+
+
+@app.middleware("http")
+async def audit(request: Request, call_next):
+    started = time.time()
+    response = await call_next(request)
+    path = request.url.path
+    # skip docs assets to keep the audit trail focused on real API calls
+    if not (path.startswith("/docs") or path.startswith("/redoc") or path == "/openapi.json"):
+        q = ("?" + request.url.query) if request.url.query else ""
+        access_log.info('%s %s %s %s%s %d %dms "%s"' % (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            client_ip(request), request.method, path, q,
+            response.status_code, int((time.time() - started) * 1000),
+            request.headers.get("user-agent", "-")[:120]))
+    return response
 
 
 # ---------- docs pages with a "back to portfolio" link ----------
@@ -166,6 +201,17 @@ def index(request: Request):
 @app.get("/health", tags=["meta"], summary="Liveness / status probe")
 def health():
     return {"ok": True}
+
+
+@app.get("/logs", include_in_schema=False, dependencies=[Depends(require_write)])
+def logs(limit: int = Query(100, ge=1, le=2000)):
+    """Recent audit lines (who/when/what). Hidden; requires the X-API-Key."""
+    try:
+        with open(LOG_PATH) as f:
+            tail = f.readlines()[-limit:]
+    except FileNotFoundError:
+        tail = []
+    return {"log": LOG_PATH, "count": len(tail), "lines": [x.rstrip("\n") for x in tail]}
 
 
 @app.get("/version", tags=["meta"], summary="Version & provenance")

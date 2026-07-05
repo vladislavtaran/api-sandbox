@@ -4,5 +4,6 @@ venv/
 .venv/
 data.db
 *.db
+*.log
 version.json
 .env
