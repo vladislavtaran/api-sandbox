@@ -5,7 +5,9 @@ A small self-hosted **testing API** — a real **SQLite-backed CRUD** resource
 interactive **Swagger UI** where you can fire real requests from the browser.
 
 Deliberately focused: just the endpoints you actually reach for when testing —
-version, status, and CRUD.
+version, status, and CRUD — but built to production conventions
+(**RFC 9457 errors, rate-limit headers, ETag/304, idempotency, Link pagination**;
+see [API design](#api-design)).
 
 **Live:** https://chrome.net.ua/api/  ·  **Docs (try it out):** https://chrome.net.ua/api/docs
 
@@ -51,6 +53,55 @@ curl -X PATCH https://chrome.net.ua/api/items/1 \
   -H 'Content-Type: application/json' -H 'X-API-Key: <key>' -d '{"qty":9}'
 curl -X DELETE https://chrome.net.ua/api/items/1 -H 'X-API-Key: <key>'
 ```
+
+## API design
+
+The API deliberately follows the conventions engineers expect from a
+production REST service:
+
+- **Standard error model — [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457)
+  `application/problem+json`.** Every 4xx/5xx returns a machine-readable problem
+  document (`type`, `title`, `status`, `detail`, `instance`); validation errors
+  add a structured `errors` array.
+  ```jsonc
+  { "type": "about:blank", "title": "Not Found", "status": 404,
+    "detail": "item not found", "instance": "/items/999" }
+  ```
+- **Rate limiting with headers.** nginx enforces the hard edge; the app adds a
+  courtesy per-IP window surfaced as `X-RateLimit-Limit / -Remaining / -Reset`,
+  and returns **`429`** + `Retry-After` when exceeded.
+- **Conditional requests / caching.** `GET /items/{id}` returns an **`ETag`**;
+  send it back as `If-None-Match` to get a **`304 Not Modified`** (no body).
+- **Idempotent creates.** `POST /items` accepts an **`Idempotency-Key`** header —
+  a repeat with the same key replays the original result (`Idempotency-Replayed:
+  true`) instead of creating a duplicate.
+- **Pagination — [RFC 8288](https://www.rfc-editor.org/rfc/rfc8288) `Link`.**
+  `GET /items` returns `X-Total-Count` and a `Link` header with
+  `first`/`prev`/`next`/`last` (on top of the `limit`/`offset` body fields).
+- **Versioning.** Every response carries an **`API-Version`** header;
+  `GET /version` reports the running build's git commit.
+
+```bash
+# problem+json error
+curl -i https://chrome.net.ua/api/items/999            # 404 application/problem+json
+
+# conditional GET (304)
+ETAG=$(curl -sD- -o/dev/null https://chrome.net.ua/api/items/1 | grep -i etag | awk '{print $2}' | tr -d '\r')
+curl -i -H "If-None-Match: $ETAG" https://chrome.net.ua/api/items/1   # 304
+
+# idempotent create (same key => same row)
+curl -X POST https://chrome.net.ua/api/items -H 'X-API-Key: <key>' \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: abc-123' \
+  -d '{"name":"widget"}'
+
+# pagination headers
+curl -sD- -o/dev/null 'https://chrome.net.ua/api/items?limit=1' | grep -iE 'x-total-count|link'
+```
+
+**Security posture** (aligned with the OWASP API Security Top 10): key-gated
+mutations (API1/API5 — broken auth / function-level authz), strict Pydantic
+input validation + row/size caps (API4 — resource consumption), problem+json
+that leaks no internals (API8), no SSRF surface, and full request auditing.
 
 ## Architecture
 
@@ -98,6 +149,8 @@ someone trying to insert 10 million rows or wipe the data:
 | `API_WRITE_KEY` | `""` (open) | required `X-API-Key` for mutations |
 | `API_MAX_ITEMS` | `1000` | hard row ceiling |
 | `API_MAX_DB_BYTES` | `52428800` | storage guard (50 MB) |
+| `API_RATE_LIMIT` | `120` | in-app requests per window per IP |
+| `API_RATE_WINDOW` | `60` | rate-limit window (seconds) |
 
 ## Logs & audit
 

@@ -14,17 +14,21 @@ Stdlib + FastAPI/Uvicorn only. Persistence is stdlib SQLite in a single file
 import os
 import time
 import hmac
+import hashlib
 import logging
 import sqlite3
+import threading
 import json as jsonlib
 from typing import Optional, List
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 
-from fastapi import FastAPI, Request, HTTPException, Path, Query, Depends
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request, Response, HTTPException, Path, Query, Depends, Header
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.security import APIKeyHeader
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, Field, field_validator
 
 # ---------- config ----------
@@ -38,6 +42,12 @@ STARTED = time.time()
 MAX_ITEMS = int(os.environ.get("API_MAX_ITEMS", "1000"))            # hard row ceiling
 MAX_DB_BYTES = int(os.environ.get("API_MAX_DB_BYTES", str(50 * 1024 * 1024)))  # 50 MB
 WRITE_KEY = os.environ.get("API_WRITE_KEY", "")                     # gate mutations (prod)
+
+# courtesy in-app rate limit (fixed window per IP) — surfaced via X-RateLimit-* headers
+RL_LIMIT = int(os.environ.get("API_RATE_LIMIT", "120"))
+RL_WINDOW = int(os.environ.get("API_RATE_WINDOW", "60"))
+_rl = {}
+_rl_lock = threading.Lock()
 
 # ---------- audit log: who / when / what, rotating so it can't grow unbounded ----------
 LOG_PATH = os.environ.get("API_LOG", os.path.join(os.path.dirname(DB_PATH) or ".", "access.log"))
@@ -73,7 +83,10 @@ app = FastAPI(
     title="chrome.net.ua API Sandbox",
     version=VERSION,
     description="A small self-hosted testing API — a SQLite-backed CRUD resource "
-                "(`items`) plus version/health. Use the **Try it out** buttons to "
+                "(`items`) plus version/health. Demonstrates production API "
+                "patterns: **RFC 9457** `problem+json` errors, **X-RateLimit-\\*** "
+                "headers, **ETag / If-None-Match** (304) caching, **Idempotency-Key** "
+                "on POST, and **RFC 8288 Link** pagination. Use **Try it out** to "
                 "fire real requests. Writes require an **X-API-Key** (click "
                 "**Authorize**); reads are open.",
     root_path=ROOT_PATH,
@@ -82,18 +95,82 @@ app = FastAPI(
 )
 
 
+# ---------- RFC 9457 problem+json errors ----------
+HTTP_TITLES = {400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
+               404: "Not Found", 409: "Conflict", 413: "Payload Too Large",
+               415: "Unsupported Media Type", 422: "Unprocessable Entity",
+               429: "Too Many Requests", 500: "Internal Server Error",
+               507: "Insufficient Storage"}
+
+
+def problem(status, title=None, detail=None, request=None, headers=None, extra=None):
+    body = {"type": "about:blank", "title": title or HTTP_TITLES.get(status, "Error"),
+            "status": status}
+    if detail:
+        body["detail"] = detail
+    if request is not None:
+        body["instance"] = str(request.url.path)
+    if extra:
+        body.update(extra)
+    return JSONResponse(body, status_code=status,
+                        media_type="application/problem+json", headers=headers)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exc(request: Request, exc: StarletteHTTPException):
+    detail = exc.detail if isinstance(exc.detail, str) else None
+    return problem(exc.status_code, detail=detail, request=request,
+                   headers=getattr(exc, "headers", None))
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exc(request: Request, exc: RequestValidationError):
+    errors = [{"loc": list(e.get("loc", [])), "msg": e.get("msg"), "type": e.get("type")}
+              for e in exc.errors()]
+    return problem(422, detail="request validation failed", request=request,
+                   extra={"errors": errors})
+
+
+# ---------- audit log + courtesy rate limit + version header, on every request ----------
 @app.middleware("http")
-async def audit(request: Request, call_next):
+async def audit_and_limit(request: Request, call_next):
     started = time.time()
-    response = await call_next(request)
     path = request.url.path
-    # skip docs assets to keep the audit trail focused on real API calls
-    if not (path.startswith("/docs") or path.startswith("/redoc") or path == "/openapi.json"):
+    exempt = path.startswith("/docs") or path.startswith("/redoc") or path == "/openapi.json"
+    ip = client_ip(request)
+    now_s = int(time.time())
+    rl_headers = {}
+    over = False
+    if not exempt:
+        with _rl_lock:
+            ws, cnt = _rl.get(ip, (now_s, 0))
+            if now_s - ws >= RL_WINDOW:
+                ws, cnt = now_s, 0
+            cnt += 1
+            _rl[ip] = (ws, cnt)
+            if len(_rl) > 10000:            # keep the map bounded
+                _rl.clear()
+                _rl[ip] = (ws, cnt)
+            reset = ws + RL_WINDOW
+            over = cnt > RL_LIMIT
+            rl_headers = {"X-RateLimit-Limit": str(RL_LIMIT),
+                          "X-RateLimit-Remaining": str(0 if over else RL_LIMIT - cnt),
+                          "X-RateLimit-Reset": str(reset)}
+    if over:
+        response = problem(429, detail="rate limit exceeded — slow down",
+                           request=request,
+                           headers={**rl_headers, "Retry-After": str(reset - now_s)})
+    else:
+        response = await call_next(request)
+        for k, v in rl_headers.items():
+            response.headers[k] = v
+    response.headers["API-Version"] = VERSION
+    if not exempt:
         q = ("?" + request.url.query) if request.url.query else ""
         access_log.info('%s %s %s %s%s %d %dms "%s"' % (
             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            client_ip(request), request.method, path, q,
-            response.status_code, int((time.time() - started) * 1000),
+            ip, request.method, path, q, response.status_code,
+            int((time.time() - started) * 1000),
             request.headers.get("user-agent", "-")[:120]))
     return response
 
@@ -149,6 +226,12 @@ def init_db():
                  tags     TEXT NOT NULL DEFAULT '[]',
                  created  TEXT NOT NULL,
                  updated  TEXT NOT NULL)"""
+        )
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS idempotency(
+                 key      TEXT PRIMARY KEY,
+                 response TEXT NOT NULL,
+                 created  TEXT NOT NULL)"""
         )
         con.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
         # seed a little demo data so reads always show something
@@ -255,6 +338,8 @@ class ItemPatch(BaseModel):
 
 @app.get("/items", tags=["items"], summary="List / search items")
 def list_items(
+    request: Request,
+    response: Response,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     q: Optional[str] = Query(None, description="substring match on name"),
@@ -270,13 +355,39 @@ def list_items(
             rows = con.execute("SELECT * FROM items ORDER BY id LIMIT ? OFFSET ?",
                                (limit, offset)).fetchall()
             total = con.execute("SELECT COUNT(*) c FROM items").fetchone()["c"]
+    # RFC 8288 Link header pagination + total count
+    base = (request.scope.get("root_path", "") or ROOT_PATH) + "/items"
+    qs = ("&q=" + q) if q else ""
+    links = []
+
+    def link(o, rel):
+        links.append('<%s?limit=%d&offset=%d%s>; rel="%s"' % (base, limit, o, qs, rel))
+
+    link(0, "first")
+    if offset > 0:
+        link(max(0, offset - limit), "prev")
+    if offset + limit < total:
+        link(offset + limit, "next")
+    link(max(0, ((total - 1) // limit) * limit) if total else 0, "last")
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["Link"] = ", ".join(links)
     return {"total": total, "limit": limit, "offset": offset,
             "items": [row_to_item(r) for r in rows]}
 
 
 @app.post("/items", tags=["items"], status_code=201, summary="Add a new item",
           dependencies=[Depends(require_write)])
-def create_item(item: ItemIn):
+def create_item(item: ItemIn,
+                idempotency_key: Optional[str] = Header(
+                    None, description="send a unique key to make this POST replay-safe")):
+    # Idempotency-Key: replay the stored result instead of creating a duplicate
+    if idempotency_key:
+        with db() as con:
+            prev = con.execute("SELECT response FROM idempotency WHERE key=?",
+                               (idempotency_key,)).fetchone()
+        if prev:
+            return JSONResponse(jsonlib.loads(prev["response"]), status_code=201,
+                                headers={"Idempotency-Replayed": "true"})
     with db() as con:
         count = con.execute("SELECT COUNT(*) c FROM items").fetchone()["c"]
     if count >= MAX_ITEMS:
@@ -291,16 +402,30 @@ def create_item(item: ItemIn):
             (item.name, item.qty, jsonlib.dumps(item.tags), ts, ts))
         new_id = cur.lastrowid
         row = con.execute("SELECT * FROM items WHERE id=?", (new_id,)).fetchone()
-    return row_to_item(row)
+    result = row_to_item(row)
+    if idempotency_key:
+        with db() as con:
+            con.execute("INSERT OR IGNORE INTO idempotency(key, response, created) "
+                        "VALUES(?,?,?)", (idempotency_key, jsonlib.dumps(result), ts))
+    return result
 
 
 @app.get("/items/{item_id}", tags=["items"], summary="Read one item")
-def get_item(item_id: int = Path(..., ge=1)):
+def get_item(response: Response, item_id: int = Path(..., ge=1),
+             if_none_match: Optional[str] = Header(None)):
     with db() as con:
         row = con.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
     if not row:
         raise HTTPException(404, "item not found")
-    return row_to_item(row)
+    item = row_to_item(row)
+    # ETag / conditional GET — return 304 when the client's copy is current
+    etag = '"%s"' % hashlib.sha256(
+        jsonlib.dumps(item, sort_keys=True).encode()).hexdigest()[:16]
+    if if_none_match and if_none_match.strip() == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-cache"
+    return item
 
 
 @app.put("/items/{item_id}", tags=["items"], summary="Update (replace) an item",

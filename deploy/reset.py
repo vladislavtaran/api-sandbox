@@ -22,10 +22,12 @@ for old in sorted(glob.glob(os.path.join(BK, "data-*.db")))[:-7]:
 # autocommit (isolation_level=None) so VACUUM can run outside a transaction
 con = sqlite3.connect(DB, timeout=10, isolation_level=None)
 con.execute("DELETE FROM items")
-try:
-    con.execute("DELETE FROM sqlite_sequence WHERE name='items'")
-except sqlite3.OperationalError:
-    pass
+for stmt in ("DELETE FROM sqlite_sequence WHERE name='items'",
+             "DELETE FROM idempotency"):
+    try:
+        con.execute(stmt)
+    except sqlite3.OperationalError:
+        pass
 ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 con.executemany("INSERT INTO items(name, qty, tags, created, updated) VALUES(?,?,?,?,?)",
                 [("sample-widget", 5, '["demo"]', ts, ts),
